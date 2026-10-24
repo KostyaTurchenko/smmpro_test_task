@@ -1,0 +1,100 @@
+x-environment: &environment
+  DATABASE_URL: postgresql://generation:generation@db:5432/generation
+  WEBHOOK_SECRET: ${WEBHOOK_SECRET:-local-development-secret}
+
+x-runtime: &runtime
+  image: generation-service:local
+  build:
+    context: .
+    target: runtime
+  init: true
+  environment: *environment
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: generation
+      POSTGRES_PASSWORD: generation
+      POSTGRES_DB: generation
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U generation -d generation"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    <<: *runtime
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  alpha:
+    <<: *runtime
+    command: ["uvicorn", "fake_provider.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      <<: *environment
+      PROVIDER_NAME: alpha
+    ports:
+      - "127.0.0.1:8001:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck: &http-health
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  beta:
+    <<: *runtime
+    command: ["uvicorn", "fake_provider.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      <<: *environment
+      PROVIDER_NAME: beta
+    ports:
+      - "127.0.0.1:8002:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck: *http-health
+
+  api:
+    <<: *runtime
+    environment:
+      <<: *environment
+      ALPHA_URL: http://alpha:8000
+      BETA_URL: http://beta:8000
+      CALLBACK_BASE_URL: http://api:8000
+      PROVIDER_TIMEOUT: ${PROVIDER_TIMEOUT:-60}
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      alpha:
+        condition: service_healthy
+      beta:
+        condition: service_healthy
+    healthcheck: *http-health
+
+  tests:
+    image: generation-service-tests:local
+    build:
+      context: .
+      target: tests
+    profiles: ["tests"]
+    environment:
+      <<: *environment
+      TEST_API_URL: http://api:8000
+      ALPHA_URL: http://alpha:8000
+      BETA_URL: http://beta:8000
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
